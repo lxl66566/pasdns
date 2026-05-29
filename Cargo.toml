@@ -1,0 +1,21 @@
+[package]
+edition = "2024"
+name    = "pasdns"
+version = "0.1.0"
+
+[dependencies]
+config-file2       = "0.4"
+dashmap            = "6"
+geosite-rs         = "0.1"
+hickory-net        = "0.26"
+hickory-proto      = "0.26"
+hickory-server     = "0.26"
+moka               = { version = "0.12", features = ["future"] }
+regex              = "1"
+rkyv               = "0.8"
+serde              = { version = "1", features = ["derive"] }
+thiserror          = "2"
+tokio              = { version = "1", features = ["full"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ustr               = "1"
