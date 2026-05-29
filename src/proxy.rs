@@ -1,5 +1,6 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
+use fastrace::prelude::*;
 use hickory_net::runtime::Time;
 use hickory_proto::{
     op::{Header, HeaderCounts, Message, Metadata, ResponseCode},
@@ -10,7 +11,7 @@ use hickory_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
     zone_handler::MessageResponseBuilder,
 };
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 use crate::{
     cache::{CacheKey, CacheLookupResult, DnsCache},
@@ -26,6 +27,7 @@ pub struct DnsProxy {
     router: Router,
     upstream_manager: UpstreamManager,
     cache: Option<DnsCache>,
+    proxy_addr: Option<SocketAddr>,
 }
 
 fn fallback_response_info(request: &Request) -> ResponseInfo {
@@ -48,15 +50,24 @@ impl DnsProxy {
         upstream_manager: UpstreamManager,
         cache: Option<DnsCache>,
     ) -> Self {
+        let proxy_addr = if config.proxy.enabled {
+            config
+                .proxy
+                .addr
+                .as_ref()
+                .and_then(|a| a.parse::<SocketAddr>().ok())
+        } else {
+            None
+        };
         Self {
             config,
             router,
             upstream_manager,
             cache,
+            proxy_addr,
         }
     }
 
-    #[allow(dead_code)]
     pub fn cache(&self) -> Option<&DnsCache> {
         self.cache.as_ref()
     }
@@ -65,7 +76,8 @@ impl DnsProxy {
     fn extract_query_info(&self, request: &Request) -> Option<(String, u16)> {
         let queries = request.queries.queries();
         let query = queries.first()?;
-        let name = query.name().to_string();
+        let raw = query.name().to_string();
+        let name = raw.strip_suffix('.').unwrap_or(&raw).to_string();
         let record_type = query.query_type();
         Some((name, record_type.into()))
     }
@@ -96,23 +108,25 @@ impl DnsProxy {
         request: &Request,
         raw_query: &[u8],
         group: &str,
+        root: &Span,
         mut rh: R,
     ) -> ResponseInfo {
         let Some((upstream, protocol)) = self.upstream_manager.pick_upstream(group) else {
-            warn!(group, "no upstream available");
+            warn!(target: "pasdns::proxy", "no upstream available for group '{group}'");
             return self.send_servfail(request, rh).await;
         };
 
         debug!(
-            domain = %request
+            target: "pasdns::proxy",
+            "forwarding {} -> {} ({:?})",
+            request
                 .queries
                 .queries()
                 .first()
                 .map(|q| q.name().to_string())
                 .unwrap_or_default(),
-            %upstream,
-            ?protocol,
-            "forwarding"
+            upstream,
+            protocol,
         );
 
         let start = std::time::Instant::now();
@@ -120,13 +134,16 @@ impl DnsProxy {
             crate::config::Protocol::Udp | crate::config::Protocol::Tcp => protocol,
             _ => crate::config::Protocol::Udp,
         };
-        let forward_result = forwarder::forward(raw_query, upstream, fwd_protocol).await;
+        let forward_result = {
+            let _fwd_span = Span::enter_with_parent("dns-forward", root);
+            forwarder::forward(raw_query, upstream, fwd_protocol, self.proxy_addr).await
+        };
         let elapsed = start.elapsed();
 
         let response_bytes = match forward_result {
             Ok(bytes) => bytes,
             Err(e) => {
-                warn!(%upstream, error = %e, "forward failed");
+                warn!(target: "pasdns::proxy", "forward to {upstream} failed: {e}");
                 return self.send_servfail(request, rh).await;
             }
         };
@@ -138,7 +155,7 @@ impl DnsProxy {
         let msg = match Message::read(&mut decoder) {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "failed to parse upstream response");
+                warn!(target: "pasdns::proxy", "failed to parse upstream response: {e}");
                 return self.send_servfail(request, rh).await;
             }
         };
@@ -218,7 +235,13 @@ impl RequestHandler for DnsProxy {
                 return self.send_servfail(request, response_handle).await;
             };
 
+            let root = Span::root("dns-request", SpanContext::random());
+            root.add_property(|| ("domain", name.clone()));
+            root.add_property(|| ("record_type", record_type.to_string()));
+
             let group = self.router.route(&name);
+            root.add_property(|| ("group", group.to_string()));
+
             let raw_query = request.as_slice();
 
             if let Some(ref cache) = self.cache {
@@ -226,26 +249,33 @@ impl RequestHandler for DnsProxy {
                     name: name.clone(),
                     record_type,
                 };
-                match cache.lookup(&key).await {
-                    CacheLookupResult::Fresh(bytes) => {
-                        debug!(%name, "cache hit (fresh)");
-                        return self
-                            .send_cached_response(request, &bytes, response_handle)
-                            .await;
-                    }
-                    CacheLookupResult::Stale(bytes) => {
-                        debug!(%name, "cache hit (stale), serving stale");
-                        return self
-                            .send_cached_response(request, &bytes, response_handle)
-                            .await;
-                    }
-                    CacheLookupResult::Miss => {
-                        debug!(%name, "cache miss");
+
+                {
+                    let _lookup = Span::enter_with_parent("cache-lookup", &root);
+                    match cache.lookup(&key).await {
+                        CacheLookupResult::Fresh(bytes) => {
+                            root.add_event(Event::new("cache-hit-fresh"));
+                            debug!(target: "pasdns::proxy", "cache hit (fresh): {name}");
+                            return self
+                                .send_cached_response(request, &bytes, response_handle)
+                                .await;
+                        }
+                        CacheLookupResult::Stale(bytes) => {
+                            root.add_event(Event::new("cache-hit-stale"));
+                            debug!(target: "pasdns::proxy", "cache hit (stale): {name}");
+                            return self
+                                .send_cached_response(request, &bytes, response_handle)
+                                .await;
+                        }
+                        CacheLookupResult::Miss => {
+                            root.add_event(Event::new("cache-miss"));
+                            debug!(target: "pasdns::proxy", "cache miss: {name}");
+                        }
                     }
                 }
             }
 
-            self.forward_and_respond(request, raw_query, group, response_handle)
+            self.forward_and_respond(request, raw_query, group, &root, response_handle)
                 .await
         })
     }

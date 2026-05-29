@@ -2,6 +2,8 @@ use std::path::Path;
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::forwarder;
+
 #[derive(Archive, Serialize, Deserialize)]
 pub struct PersistedCache {
     pub entries: Vec<PersistedEntry>,
@@ -20,8 +22,7 @@ pub fn save_cache(entries: Vec<PersistedEntry>, path: &Path) -> std::io::Result<
     let data = PersistedCache { entries };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&data)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(path, bytes.as_slice())?;
-    Ok(())
+    forwarder::atomic_write(path, &bytes)
 }
 
 pub fn load_cache(path: &Path) -> std::io::Result<Vec<PersistedEntry>> {

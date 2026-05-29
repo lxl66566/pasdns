@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub geosite_path: Option<String>,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -148,4 +150,12 @@ impl Default for PersistenceConfig {
 
 fn default_persistence_path() -> String {
     "pasdns.cache".to_string()
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub addr: Option<String>,
 }

@@ -1,8 +1,8 @@
 use std::{io::Read, path::Path};
 
 use geosite_rs::{GeoSiteList, decode_geosite, domain::Type as GeoDomainType};
+use log::{info, warn};
 use regex::Regex;
-use tracing::{info, warn};
 use ustr::ustr;
 
 use crate::config::RouteConfig;
@@ -49,7 +49,7 @@ impl Router {
             }
         }
 
-        info!(rule_count = rules.len(), "router built");
+        info!(target: "pasdns::router", "router built with {} rules", rules.len());
         Self {
             rules,
             default_group: default_group.to_string(),
@@ -83,7 +83,7 @@ fn add_geosite_group(
     group: &str,
 ) {
     let Some(entry) = geosite.entry.iter().find(|e| e.country_code == tag) else {
-        warn!(tag, "geosite tag not found");
+        warn!(target: "pasdns::router", "geosite tag not found: {tag}");
         return;
     };
 
@@ -96,7 +96,9 @@ fn add_geosite_group(
             }
             GeoDomainType::Regex => match Regex::new(&value) {
                 Ok(re) => rules.push((MatchRule::Regex(re), group.to_string())),
-                Err(e) => warn!(pattern = %value, error = %e, "invalid geosite regex"),
+                Err(e) => {
+                    warn!(target: "pasdns::router", "invalid geosite regex '{}': {e}", value)
+                }
             },
             GeoDomainType::Domain => {
                 rules.push((MatchRule::WildcardSuffix(ustr(&value)), group.to_string()));
@@ -110,7 +112,7 @@ fn add_geosite_group(
             }
         }
     }
-    info!(tag, count, "loaded geosite group");
+    info!(target: "pasdns::router", "loaded geosite group '{tag}' with {count} rules");
 }
 
 pub fn load_geosite(path: &Path) -> Option<GeoSiteList> {
@@ -119,23 +121,23 @@ pub fn load_geosite(path: &Path) -> Option<GeoSiteList> {
         Ok(mut f) => match f.read_to_end(&mut buf) {
             Ok(_) => {}
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "failed to read geosite.dat");
+                warn!(target: "pasdns::router", "failed to read {}: {e}", path.display());
                 return None;
             }
         },
         Err(e) => {
-            warn!(path = %path.display(), error = %e, "geosite.dat not found, skipping");
+            warn!(target: "pasdns::router", "geosite not found {}: {e}", path.display());
             return None;
         }
     }
     match decode_geosite(&buf) {
         Ok(list) => {
             let groups = list.entry.len();
-            info!(path = %path.display(), groups, "loaded geosite.dat");
+            info!(target: "pasdns::router", "loaded {} with {groups} groups", path.display());
             Some(list)
         }
         Err(e) => {
-            warn!(path = %path.display(), error = %e, "failed to parse geosite.dat");
+            warn!(target: "pasdns::router", "failed to parse {}: {e}", path.display());
             None
         }
     }

@@ -1,21 +1,19 @@
-mod cache;
-mod config;
-mod forwarder;
-mod persist;
-mod proxy;
-mod router;
-mod upstream;
-
 use std::{
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use config::AppConfig;
 use config_file2::LoadConfigFile;
-use proxy::DnsProxy;
-use tracing_subscriber::EnvFilter;
+use fastrace::collector::{Config, ConsoleReporter};
+use log::{error, info, warn};
+use pasdns::{
+    cache,
+    config::{AppConfig, Protocol},
+    forwarder, persist,
+    proxy::DnsProxy,
+    router, signal, upstream,
+};
 
 fn find_default_group(config: &AppConfig) -> &str {
     config
@@ -55,10 +53,10 @@ async fn load_cache_from_disk(cache: &cache::DnsCache, path: &Path) {
                     .await;
                 loaded += 1;
             }
-            tracing::info!(loaded, "restored cache entries from disk");
+            info!(target: "pasdns", "restored {loaded} cache entries from disk");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to load cache from disk");
+            warn!(target: "pasdns", "failed to load cache from disk: {e}");
         }
     }
 }
@@ -83,26 +81,36 @@ fn save_cache_to_disk(cache: &cache::DnsCache, path: &Path) {
         })
         .collect();
     match persist::save_cache(persisted, path) {
-        Ok(()) => tracing::info!("cache persisted to disk"),
-        Err(e) => tracing::warn!(error = %e, "failed to persist cache"),
+        Ok(()) => info!(target: "pasdns", "cache persisted to disk"),
+        Err(e) => warn!(target: "pasdns", "failed to persist cache: {e}"),
+    }
+}
+
+fn cleanup_temp(path: &Path) {
+    let tmp = forwarder::temp_path_for(path);
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .init();
+    fastrace::set_reporter(ConsoleReporter, Config::default());
 
     let config = match AppConfig::load_or_default("pasdns.toml") {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "failed to load config");
+            error!(target: "pasdns", "failed to load config: {e}");
             std::process::exit(1);
         }
     };
 
-    tracing::info!(listen = ?config.server.listen, protocols = ?config.server.protocol, "starting pasdns");
+    info!(
+        target: "pasdns",
+        "starting pasdns on {:?} ({:?})",
+        config.server.listen,
+        config.server.protocol,
+    );
 
     let default_group = find_default_group(&config);
     let geosite_data = config
@@ -140,52 +148,70 @@ async fn main() {
         let addr: std::net::SocketAddr = match addr_str.parse() {
             Ok(a) => a,
             Err(e) => {
-                tracing::error!(addr = addr_str, error = %e, "invalid listen address");
+                error!(target: "pasdns", "invalid listen address '{addr_str}': {e}");
                 continue;
             }
         };
 
         for proto in &config.server.protocol {
             match proto {
-                config::Protocol::Udp => match tokio::net::UdpSocket::bind(addr).await {
+                Protocol::Udp => match tokio::net::UdpSocket::bind(addr).await {
                     Ok(socket) => {
-                        tracing::info!(%addr, "listening on UDP");
+                        info!(target: "pasdns", "listening on UDP {addr}");
                         server.register_socket(socket);
                     }
-                    Err(e) => tracing::error!(%addr, error = %e, "failed to bind UDP"),
+                    Err(e) => error!(target: "pasdns", "failed to bind UDP {addr}: {e}"),
                 },
-                config::Protocol::Tcp => match tokio::net::TcpListener::bind(addr).await {
+                Protocol::Tcp => match tokio::net::TcpListener::bind(addr).await {
                     Ok(listener) => {
-                        tracing::info!(%addr, "listening on TCP");
+                        info!(target: "pasdns", "listening on TCP {addr}");
                         server.register_listener(listener, Duration::from_secs(30), 4096);
                     }
-                    Err(e) => tracing::error!(%addr, error = %e, "failed to bind TCP"),
+                    Err(e) => error!(target: "pasdns", "failed to bind TCP {addr}: {e}"),
                 },
                 _ => {
-                    tracing::warn!(?proto, "protocol not yet implemented");
+                    warn!(target: "pasdns", "protocol {proto:?} not yet implemented");
                 }
             }
         }
     }
 
-    tracing::info!("pasdns ready");
+    if config.proxy.enabled
+        && let Some(proxy_addr) = config.proxy.addr.as_ref()
+    {
+        info!(target: "pasdns", "upstream proxy enabled: {proxy_addr}");
+    }
+
+    info!(target: "pasdns", "pasdns ready");
+
+    signal::install();
 
     tokio::select! {
         result = server.block_until_done() => {
             if let Err(e) = &result {
-                tracing::error!(error = %e, "server error");
+                error!(target: "pasdns", "server error: {e}");
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutting down...");
-            if let Some((cache, path)) = &cache_for_shutdown {
-                save_cache_to_disk(cache, Path::new(path));
-            }
-            if let Err(e) = server.shutdown_gracefully().await {
-                tracing::warn!(error = %e, "graceful shutdown error");
-            }
+            info!(target: "pasdns", "received ctrl+c, shutting down...");
+        }
+        _ = signal::wait_for_shutdown() => {
+            info!(target: "pasdns", "received shutdown signal, shutting down...");
         }
     }
 
-    tracing::info!("pasdns stopped");
+    if let Some((cache, path)) = &cache_for_shutdown {
+        let path = Path::new(path);
+        save_cache_to_disk(cache, path);
+        cleanup_temp(path);
+    }
+
+    signal::notify_cleanup_done();
+
+    if let Err(e) = server.shutdown_gracefully().await {
+        warn!(target: "pasdns", "graceful shutdown error: {e}");
+    }
+
+    fastrace::flush();
+    info!(target: "pasdns", "pasdns stopped");
 }
