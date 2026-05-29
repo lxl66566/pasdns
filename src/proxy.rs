@@ -111,7 +111,7 @@ impl DnsProxy {
         root: &Span,
         mut rh: R,
     ) -> ResponseInfo {
-        let Some((upstream, protocol)) = self.upstream_manager.pick_upstream(group) else {
+        let Some(target) = self.upstream_manager.pick_upstream(group) else {
             warn!(target: "pasdns::proxy", "no upstream available for group '{group}'");
             return self.send_servfail(request, rh).await;
         };
@@ -125,31 +125,34 @@ impl DnsProxy {
                 .first()
                 .map(|q| q.name().to_string())
                 .unwrap_or_default(),
-            upstream,
-            protocol,
+            target.addr,
+            target.protocol,
         );
 
         let start = std::time::Instant::now();
-        let fwd_protocol = match protocol {
-            crate::config::Protocol::Udp | crate::config::Protocol::Tcp => protocol,
-            _ => crate::config::Protocol::Udp,
-        };
         let forward_result = {
             let _fwd_span = Span::enter_with_parent("dns-forward", root);
-            forwarder::forward(raw_query, upstream, fwd_protocol, self.proxy_addr).await
+            forwarder::forward(
+                raw_query,
+                target.addr,
+                target.protocol,
+                self.proxy_addr,
+                target.doh_url.as_deref(),
+            )
+            .await
         };
         let elapsed = start.elapsed();
 
         let response_bytes = match forward_result {
             Ok(bytes) => bytes,
             Err(e) => {
-                warn!(target: "pasdns::proxy", "forward to {upstream} failed: {e}");
+                warn!(target: "pasdns::proxy", "forward to {} failed: {e}", target.addr);
                 return self.send_servfail(request, rh).await;
             }
         };
 
         self.upstream_manager
-            .record_latency(upstream, group, elapsed);
+            .record_latency(target.addr, group, elapsed);
 
         let mut decoder = BinDecoder::new(&response_bytes);
         let msg = match Message::read(&mut decoder) {

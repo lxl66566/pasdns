@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);

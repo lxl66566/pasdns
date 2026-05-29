@@ -11,8 +11,6 @@ use hickory_proto::{
     serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder},
 };
 use hickory_server::server::Server;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 use pasdns::{
     cache::{CacheKey, CacheLookupResult, DnsCache},
     config::*,
@@ -21,6 +19,7 @@ use pasdns::{
     router::Router,
     upstream::UpstreamManager,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn build_query(name: &str, record_type: RecordType, id: u16) -> Vec<u8> {
     let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
@@ -114,9 +113,7 @@ impl MockUpstream {
     }
 
     async fn tcp(ip: Ipv4Addr) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             loop {
@@ -201,9 +198,7 @@ async fn start_tcp_server(groups: Vec<GroupConfig>) -> TestServer {
     let upstream = UpstreamManager::new(&config.group);
     let cache = DnsCache::new(1000, 300);
     let proxy = DnsProxy::new(config, router, upstream, Some(cache.clone()));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut server = Server::new(proxy);
     server.register_listener(listener, Duration::from_secs(30), 4096);
@@ -337,7 +332,11 @@ async fn route_directs_to_correct_upstream_group() {
     let resp_a = parse_response(
         &send_udp_query(server.addr, &build_query("a.example", RecordType::A, 1)).await,
     );
-    assert_eq!(resp_a.response_code, ResponseCode::NoError, "a.example response code");
+    assert_eq!(
+        resp_a.response_code,
+        ResponseCode::NoError,
+        "a.example response code"
+    );
     assert!(!resp_a.answers.is_empty(), "a.example should have answers");
     match &resp_a.answers[0].data {
         RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(1, 1, 1, 1)),
@@ -347,7 +346,11 @@ async fn route_directs_to_correct_upstream_group() {
     let resp_b = parse_response(
         &send_udp_query(server.addr, &build_query("b.example", RecordType::A, 2)).await,
     );
-    assert_eq!(resp_b.response_code, ResponseCode::NoError, "b.example response code");
+    assert_eq!(
+        resp_b.response_code,
+        ResponseCode::NoError,
+        "b.example response code"
+    );
     assert!(!resp_b.answers.is_empty(), "b.example should have answers");
     match &resp_b.answers[0].data {
         RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(2, 2, 2, 2)),

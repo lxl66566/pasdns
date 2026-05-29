@@ -5,7 +5,7 @@ use std::{
 };
 
 use config_file2::LoadConfigFile;
-use fastrace::collector::{Config, ConsoleReporter};
+use fastrace::collector::{Config, Reporter, SpanId, SpanRecord};
 use log::{error, info, warn};
 use pasdns::{
     cache,
@@ -14,6 +14,46 @@ use pasdns::{
     proxy::DnsProxy,
     router, signal, upstream,
 };
+
+struct CompactReporter;
+
+impl Reporter for CompactReporter {
+    fn report(&mut self, spans: Vec<SpanRecord>) {
+        for span in spans {
+            let is_root = span.parent_id == SpanId(0);
+            let props: String = span
+                .properties
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let events: String = span
+                .events
+                .iter()
+                .map(|e| e.name.as_ref())
+                .collect::<Vec<_>>()
+                .join(",");
+            let duration_ms = span.duration_ns as f64 / 1_000_000.0;
+            if is_root {
+                log::info!(
+                    target: "pasdns::trace",
+                    "[{}] {} | {} ({:.1}ms)",
+                    span.name,
+                    props,
+                    events,
+                    duration_ms,
+                );
+            } else {
+                log::debug!(
+                    target: "pasdns::trace",
+                    "[{}] ({:.1}ms)",
+                    span.name,
+                    duration_ms,
+                );
+            }
+        }
+    }
+}
 
 fn find_default_group(config: &AppConfig) -> &str {
     config
@@ -95,7 +135,9 @@ fn cleanup_temp(path: &Path) {
 
 #[tokio::main]
 async fn main() {
-    fastrace::set_reporter(ConsoleReporter, Config::default());
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    fastrace::set_reporter(CompactReporter, Config::default());
 
     let config = match AppConfig::load_or_default("pasdns.toml") {
         Ok(c) => c,
@@ -169,8 +211,21 @@ async fn main() {
                     }
                     Err(e) => error!(target: "pasdns", "failed to bind TCP {addr}: {e}"),
                 },
-                _ => {
-                    warn!(target: "pasdns", "protocol {proto:?} not yet implemented");
+                Protocol::Dot => {
+                    if let Err(e) =
+                        register_dot_listener(&mut server, &config, addr, Duration::from_secs(30))
+                            .await
+                    {
+                        error!(target: "pasdns", "failed to register DOT on {addr}: {e}");
+                    }
+                }
+                Protocol::Doh => {
+                    if let Err(e) =
+                        register_doh_listener(&mut server, &config, addr, Duration::from_secs(30))
+                            .await
+                    {
+                        error!(target: "pasdns", "failed to register DOH on {addr}: {e}");
+                    }
                 }
             }
         }
@@ -214,4 +269,61 @@ async fn main() {
 
     fastrace::flush();
     info!(target: "pasdns", "pasdns stopped");
+}
+
+fn load_tls_cert_resolver(
+    config: &AppConfig,
+) -> std::io::Result<Arc<dyn rustls::server::ResolvesServerCert>> {
+    let tls = config.server.tls.as_ref().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "server.tls config required for DOT/DOH",
+        )
+    })?;
+
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&tls.cert_path)
+        .map_err(|e| std::io::Error::other(format!("failed to read cert: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| std::io::Error::other(format!("failed to parse cert: {e}")))?;
+
+    let key = PrivateKeyDer::from_pem_file(&tls.key_path)
+        .map_err(|e| std::io::Error::other(format!("failed to read key: {e}")))?;
+
+    let provider = rustls::crypto::ring::default_provider();
+    let certified_key = rustls::sign::CertifiedKey::from_der(certs, key, &provider)
+        .map_err(|e| std::io::Error::other(format!("failed to load cert/key: {e}")))?;
+    Ok(Arc::new(rustls::sign::SingleCertAndKey::from(
+        certified_key,
+    )))
+}
+
+async fn register_dot_listener<T: hickory_server::server::RequestHandler>(
+    server: &mut hickory_server::server::Server<T>,
+    config: &AppConfig,
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let cert_resolver = load_tls_cert_resolver(config)?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(target: "pasdns", "listening on DOT {addr}");
+    server.register_tls_listener(listener, timeout, cert_resolver)
+}
+
+async fn register_doh_listener<T: hickory_server::server::RequestHandler>(
+    server: &mut hickory_server::server::Server<T>,
+    config: &AppConfig,
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let cert_resolver = load_tls_cert_resolver(config)?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(target: "pasdns", "listening on DOH {addr}");
+    server.register_https_listener(
+        listener,
+        timeout,
+        cert_resolver,
+        None,
+        "/dns-query".to_string(),
+    )
 }

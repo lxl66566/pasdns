@@ -4,13 +4,12 @@
 
 ## 特性
 
-- 高性能 — 基于 Hickory-DNS，支持 UDP/TCP 协议，fastrace 追踪
+- 高性能 — 基于 Hickory-DNS，支持 UDP/TCP/DOT/DOH 协议，fastrace 追踪
 - 转发策略 — 轮询（Round Robin）、最快响应（Fastest）、近 10 次最低平均延迟（Min-Avg-10）
-- 灵活的路由 — 域名匹配（精确/通配符/关键字/正则）+ Geosite 分组
-- 多上游分组 — 每个分组包含一批 DNS 上游，支持域名到分组的多对多映射
+- 灵活的路由 — 域名匹配（精确/通配符/关键字/正则）+ Geosite 分组，支持多上游分组的多对多映射
 - 乐观缓存 — 基于 Moka 的高性能缓存，支持过期后继续返回旧结果
 - 退出持久化 — 使用 rkyv 零拷贝序列化，自动捕获关机/注销/退出信号，保存缓存到磁盘
-- SOCKS5 代理 — 可选的 SOCKS5 代理支持，用于上游 DNS 连接
+- SOCKS5 代理 — 可选的 SOCKS5 代理支持，用于上游 TCP DNS 连接
 
 ## 快速开始
 
@@ -33,8 +32,12 @@ listen = ["0.0.0.0:53"]
 
 # 支持的协议列表
 # 可选值: "udp", "tcp", "dot" (DNS-over-TLS), "doh" (DNS-over-HTTPS)
-# 注意: dot 和 doh 目前尚未实现
 protocol = ["udp", "tcp"]
+
+# 服务端 TLS 证书（dot/doh 协议需要）
+# [server.tls]
+# cert_path = "cert.pem"
+# key_path = "cert.key"
 
 # ---------- Geosite 数据路径 ----------
 # geosite.dat 文件的路径，用于基于地理位置的域名分组。如果不设置或文件不存在，则跳过 geosite 规则
@@ -74,8 +77,10 @@ upstreams = ["223.5.5.5:53", "119.29.29.29:53"]
 name = "secure"
 strategy = "min-avg-10"
 upstreams = [
-  { addr = "9.9.9.9:53", protocol = "tcp" },
-  { addr = "1.0.0.1:53", protocol = "tcp" },
+  # DNS-over-TLS (DOT)
+  { addr = "1.1.1.1:53", protocol = "dot" },
+  # DNS-over-HTTPS (DOH) — 使用完整 URL
+  { addr = "https://1.1.1.1/dns-query", protocol = "doh" },
 ]
 
 # ---------- 路由规则 ----------
@@ -124,7 +129,7 @@ path = "pasdns.cache"
 ## 工作原理
 
 ```
-客户端请求 → pasdns 监听 (UDP/TCP)
+客户端请求 → pasdns 监听 (UDP/TCP/DOT/DOH)
     ↓
 路由匹配（域名 → 上游分组）
     ↓
@@ -132,7 +137,7 @@ path = "pasdns.cache"
     ↓
 转发策略选择上游服务器
     ↓
-通过代理（可选）转发到上游 DNS
+通过代理（可选）转发到上游 DNS (UDP/TCP/DOT/DOH)
     ↓
 缓存结果 → 返回给客户端
 ```

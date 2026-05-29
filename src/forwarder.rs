@@ -2,20 +2,32 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
+use bytes::Bytes;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     time::timeout,
 };
+use tokio_rustls::TlsConnector;
 
 use crate::config::Protocol;
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DNS_MESSAGE_SIZE: usize = 4096;
 const CACHE_TEMP_FILE: &str = "pasdns.cache.tmp";
+
+static TLS_CONNECTOR: LazyLock<TlsConnector> = LazyLock::new(|| {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
+});
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForwardError {
@@ -166,16 +178,120 @@ pub async fn forward_tcp(
     Ok(response)
 }
 
+pub async fn forward_dot(raw_query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>> {
+    let tcp_stream = timeout(FORWARD_TIMEOUT, TcpStream::connect(upstream))
+        .await
+        .map_err(|_| ForwardError::Timeout)??;
+
+    let server_name =
+        rustls::pki_types::ServerName::try_from(upstream.ip().to_string()).map_err(|e| {
+            ForwardError::Io(std::io::Error::other(format!("invalid server name: {e}")))
+        })?;
+    let tls_stream = TLS_CONNECTOR
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("tls handshake: {e}"))))?;
+
+    let mut stream = tls_stream;
+    let len = u16::try_from(raw_query.len()).map_err(|_| {
+        ForwardError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "query too large",
+        ))
+    })?;
+    timeout(FORWARD_TIMEOUT, async {
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(raw_query).await
+    })
+    .await
+    .map_err(|_| ForwardError::Timeout)??;
+
+    let mut len_buf = [0u8; 2];
+    timeout(FORWARD_TIMEOUT, stream.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| ForwardError::Timeout)??;
+    let response_len = u16::from_be_bytes(len_buf) as usize;
+    let mut response = vec![0u8; response_len];
+    timeout(FORWARD_TIMEOUT, stream.read_exact(&mut response))
+        .await
+        .map_err(|_| ForwardError::Timeout)??;
+    Ok(response)
+}
+
+pub async fn forward_doh(raw_query: &[u8], url: &str, server_addr: SocketAddr) -> Result<Vec<u8>> {
+    let tcp_stream = timeout(FORWARD_TIMEOUT, TcpStream::connect(server_addr))
+        .await
+        .map_err(|_| ForwardError::Timeout)??;
+
+    let parsed = http::Uri::try_from(url)
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("invalid doh url: {e}"))))?;
+    let host = parsed.host().unwrap_or("");
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|e| {
+        ForwardError::Io(std::io::Error::other(format!("invalid server name: {e}")))
+    })?;
+    let tls_stream = TLS_CONNECTOR
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("tls handshake: {e}"))))?;
+
+    let (mut client, connection) = h2::client::handshake(tls_stream)
+        .await
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 handshake: {e}"))))?;
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let path = parsed
+        .path_and_query()
+        .map_or("/dns-query", |pq| pq.as_str());
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .header("host", host)
+        .body(())
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 request: {e}"))))?;
+
+    let (response, mut send_stream) = client
+        .send_request(request, false)
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 send_request: {e}"))))?;
+
+    send_stream
+        .send_data(Bytes::from(raw_query.to_vec()), true)
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 send_data: {e}"))))?;
+
+    let response = timeout(FORWARD_TIMEOUT, response)
+        .await
+        .map_err(|_| ForwardError::Timeout)?
+        .map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 response: {e}"))))?;
+
+    let mut body = response.into_body();
+    let mut data = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk =
+            chunk.map_err(|e| ForwardError::Io(std::io::Error::other(format!("h2 body: {e}"))))?;
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
+}
+
 pub async fn forward(
     raw_query: &[u8],
     upstream: SocketAddr,
     protocol: Protocol,
     proxy_addr: Option<SocketAddr>,
+    doh_url: Option<&str>,
 ) -> Result<Vec<u8>> {
     match protocol {
         Protocol::Udp => forward_udp(raw_query, upstream).await,
         Protocol::Tcp => forward_tcp(raw_query, upstream, proxy_addr).await,
-        _ => Err(ForwardError::UnsupportedProtocol),
+        Protocol::Dot => forward_dot(raw_query, upstream).await,
+        Protocol::Doh => {
+            let url = doh_url.ok_or(ForwardError::UnsupportedProtocol)?;
+            forward_doh(raw_query, url, upstream).await
+        }
     }
 }
 
@@ -208,5 +324,7 @@ fn rename_or_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 pub fn temp_path_for(path: &Path) -> PathBuf {
-    path.parent().unwrap_or(Path::new(".")).join(CACHE_TEMP_FILE)
+    path.parent()
+        .unwrap_or(Path::new("."))
+        .join(CACHE_TEMP_FILE)
 }

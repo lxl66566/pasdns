@@ -22,6 +22,14 @@ pub struct ServerConfig {
     pub listen: Vec<String>,
     #[serde(default = "default_protocol")]
     pub protocol: Vec<Protocol>,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 impl Default for ServerConfig {
@@ -29,6 +37,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             protocol: default_protocol(),
+            tls: None,
         }
     }
 }

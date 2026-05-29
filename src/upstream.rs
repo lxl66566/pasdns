@@ -6,6 +6,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use log::warn;
 
 use crate::config::{GroupConfig, Protocol, Strategy, UpstreamAddr};
 
@@ -13,8 +14,14 @@ pub struct UpstreamManager {
     groups: HashMap<String, UpstreamGroup>,
 }
 
+pub(crate) struct UpstreamTarget {
+    pub(crate) addr: SocketAddr,
+    pub(crate) protocol: Protocol,
+    pub(crate) doh_url: Option<String>,
+}
+
 struct UpstreamGroup {
-    upstreams: Vec<(SocketAddr, Protocol)>,
+    targets: Vec<UpstreamTarget>,
     strategy: Strategy,
     counter: AtomicUsize,
     latencies: DashMap<SocketAddr, LatencyStats>,
@@ -52,28 +59,58 @@ impl LatencyStats {
 
 impl UpstreamGroup {
     fn new(config: &GroupConfig) -> Self {
-        let upstreams: Vec<(SocketAddr, Protocol)> = config
+        let targets: Vec<UpstreamTarget> = config
             .upstreams
             .iter()
-            .map(|addr| match addr {
+            .filter_map(|addr| match addr {
                 UpstreamAddr::Simple(s) => {
-                    (s.parse().expect("invalid upstream address"), Protocol::Udp)
+                    let socket_addr: SocketAddr = s.parse().ok()?;
+                    Some(UpstreamTarget {
+                        addr: socket_addr,
+                        protocol: Protocol::Udp,
+                        doh_url: None,
+                    })
                 }
-                UpstreamAddr::Detailed { addr, protocol } => {
-                    (addr.parse().expect("invalid upstream address"), *protocol)
-                }
+                UpstreamAddr::Detailed { addr, protocol } => match protocol {
+                    Protocol::Doh => {
+                        let parsed = http::Uri::try_from(addr.as_str()).ok()?;
+                        let host = parsed.host()?;
+                        let port = parsed.port_u16().unwrap_or(443);
+                        let socket_addr: SocketAddr = format!("{host}:{port}").parse().ok()?;
+                        Some(UpstreamTarget {
+                            addr: socket_addr,
+                            protocol: Protocol::Doh,
+                            doh_url: Some(addr.clone()),
+                        })
+                    }
+                    _ => {
+                        let socket_addr: SocketAddr = addr.parse().ok()?;
+                        Some(UpstreamTarget {
+                            addr: socket_addr,
+                            protocol: *protocol,
+                            doh_url: None,
+                        })
+                    }
+                },
             })
             .collect();
+        if targets.len() != config.upstreams.len() {
+            warn!(
+                target: "pasdns::upstream",
+                "group '{}': some upstreams failed to parse",
+                config.name,
+            );
+        }
         Self {
-            upstreams,
+            targets,
             strategy: config.strategy,
             counter: AtomicUsize::new(0),
             latencies: DashMap::new(),
         }
     }
 
-    fn pick_upstream(&self) -> Option<(SocketAddr, Protocol)> {
-        if self.upstreams.is_empty() {
+    fn pick_upstream(&self) -> Option<&UpstreamTarget> {
+        if self.targets.is_empty() {
             return None;
         }
         match self.strategy {
@@ -84,22 +121,22 @@ impl UpstreamGroup {
         }
     }
 
-    fn pick_round_robin(&self) -> (SocketAddr, Protocol) {
-        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.upstreams.len();
-        self.upstreams[idx]
+    fn pick_round_robin(&self) -> &UpstreamTarget {
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.targets.len();
+        &self.targets[idx]
     }
 
-    fn pick_by_latency(&self) -> Option<(SocketAddr, Protocol)> {
-        let mut best: Option<(SocketAddr, Protocol, Duration)> = None;
-        for (addr, proto) in &self.upstreams {
-            if let Some(stats) = self.latencies.get(addr)
+    fn pick_by_latency(&self) -> Option<&UpstreamTarget> {
+        let mut best: Option<(&UpstreamTarget, Duration)> = None;
+        for target in &self.targets {
+            if let Some(stats) = self.latencies.get(&target.addr)
                 && let Some(avg) = stats.avg()
-                && best.is_none_or(|(_, _, d)| avg < d)
+                && best.as_ref().is_none_or(|(_, d)| avg < *d)
             {
-                best = Some((*addr, *proto, avg));
+                best = Some((target, avg));
             }
         }
-        best.map(|(a, p, _)| (a, p))
+        best.map(|(t, _)| t)
     }
 }
 
@@ -112,7 +149,7 @@ impl UpstreamManager {
         Self { groups }
     }
 
-    pub fn pick_upstream(&self, group: &str) -> Option<(SocketAddr, Protocol)> {
+    pub(crate) fn pick_upstream(&self, group: &str) -> Option<&UpstreamTarget> {
         self.groups.get(group)?.pick_upstream()
     }
 
