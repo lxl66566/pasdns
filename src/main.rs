@@ -1,10 +1,19 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use config_file2::LoadConfigFile;
+use palc::Parser;
+
+#[derive(Parser)]
+#[command(name = "pasdns", version)]
+struct Cli {
+    #[arg(short, long, default_value = "pasdns.toml")]
+    config: PathBuf,
+}
+
 use fastrace::collector::{Config, Reporter, SpanId, SpanRecord};
 use log::{error, info, warn};
 use pasdns::{
@@ -139,8 +148,13 @@ async fn main() {
 
     fastrace::set_reporter(CompactReporter, Config::default());
 
-    let config = match AppConfig::load_or_default("pasdns.toml") {
-        Ok(c) => c,
+    let cli = Cli::parse();
+    let config = match AppConfig::load(&cli.config) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            error!(target: "pasdns", "failed to load config: {} not found", cli.config.display());
+            std::process::exit(1);
+        }
         Err(e) => {
             error!(target: "pasdns", "failed to load config: {e}");
             std::process::exit(1);

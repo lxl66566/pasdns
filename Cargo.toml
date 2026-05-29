@@ -17,6 +17,7 @@ hickory-server = { version = "0.26", features = ["tls-ring", "https-ring"] }
 http           = "1"
 log            = "0.4"
 moka           = { version = "0.12", features = ["future"] }
+palc           = { version = "0.0.2", features = ["help"] }
 regex          = "1"
 rkyv           = "0.8"
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

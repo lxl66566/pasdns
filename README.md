@@ -4,19 +4,19 @@
 
 ## 特性
 
-- 高性能 — 基于 Hickory-DNS，支持 UDP/TCP/DOT/DOH 协议，fastrace 追踪
-- 转发策略 — 轮询（Round Robin）、最快响应（Fastest）、近 10 次最低平均延迟（Min-Avg-10）
-- 灵活的路由 — 域名匹配（精确/通配符/关键字/正则）+ Geosite 分组，支持多上游分组的多对多映射
-- 乐观缓存 — 基于 Moka 的高性能缓存，支持过期后继续返回旧结果
-- 退出持久化 — 使用 rkyv 零拷贝序列化，自动捕获关机/注销/退出信号，保存缓存到磁盘
-- SOCKS5 代理 — 可选的 SOCKS5 代理支持，用于上游 TCP DNS 连接
+- 基于 Hickory-DNS，支持 UDP/TCP/DOT/DOH 协议，fastrace 追踪
+- 转发策略：轮询（Round Robin）、最快响应（Fastest）、近 10 次最低平均延迟（Min-Avg-10）
+- 灵活的路由：域名匹配（精确/通配符/关键字/正则）+ Geosite 分组，支持多上游分组的多对多映射
+- 缓存：基于 moka 的乐观缓存
+- 退出持久化：使用 rkyv 零拷贝序列化，自动捕获关机/注销/退出信号，保存缓存到磁盘
+- SOCKS5 代理：可选的 SOCKS5 代理支持，用于上游 TCP DNS 连接
 
 ## 快速开始
 
-从 Release 中下载可执行文件；在目录下创建 `pasdns.toml` 配置文件，然后运行：
+从 Release 中下载可执行文件；创建 `pasdns.toml` 配置文件，然后运行：
 
 ```bash
-pasdns
+pasdns -c pasdns.toml
 ```
 
 ## 配置示例
